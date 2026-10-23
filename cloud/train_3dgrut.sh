@@ -14,7 +14,7 @@ set -euo pipefail
 
 SCENE=$(realpath "${1:?usage: train_3dgrut.sh <scene folder>}")
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-GRUT=${GRUT_DIR:-$HOME/3dgrut}
+GRUT=${GRUT_DIR:-$ROOT/.tools/3dgrut}   # inside the project so it survives container restarts
 ITERS=${ITERS:-30000}
 CONFIG=${CONFIG:-apps/colmap_3dgut_mcmc.yaml}   # 3DGUT (not 3DGRT): rasterized, what NuRec expects
 NAME=$(basename "$SCENE")
@@ -24,12 +24,17 @@ mkdir -p "$OUT"
 [ -d "$SCENE/images" ] && [ -f "$SCENE/sparse/0/images.bin" ] || {
   echo "Expected $SCENE/images and $SCENE/sparse/0 (run stages/poses.py on the laptop first)"; exit 1; }
 
-# ---- 1. install 3DGRUT once (uv-based installer; uses the system CUDA 12.x toolkit) -------------
-if [ ! -d "$GRUT" ]; then
-  git clone --recursive https://github.com/nv-tlabs/3dgrut.git "$GRUT"
-  command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
-  export PATH="$HOME/.local/bin:$PATH"
-  (cd "$GRUT" && ./install_env_uv.sh)
+# ---- 1. install 3DGRUT once (uv-based installer) ------------------------------------------------
+# No system CUDA toolkit in the Isaac Sim container, so 3DGRUT downloads CUDA 12 into its own .venv.
+# uv, its Pythons and its cache also live under .tools/.
+export PATH="$ROOT/.tools/uv:$PATH"
+export UV_PYTHON_INSTALL_DIR="$ROOT/.tools/uv-python" UV_CACHE_DIR="$ROOT/.tools/uv-cache"
+if [ ! -x "$GRUT/.venv/bin/python" ]; then
+  [ -d "$GRUT" ] || git clone --recursive https://github.com/nv-tlabs/3dgrut.git "$GRUT"
+  command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh |
+    env UV_INSTALL_DIR="$ROOT/.tools/uv" UV_NO_MODIFY_PATH=1 sh
+  (cd "$GRUT" && FORCE_LOCAL_CUDA=1 CUDA_VERSION=12 ./scripts/create_venv_cuda.sh &&
+    source .venv/bin/activate && ./install_env_uv.sh)
 fi
 # shellcheck disable=SC1091
 source "$GRUT/.venv/bin/activate"
@@ -40,9 +45,13 @@ cd "$GRUT"
 # downsample_factor=1: poses.py already resized images to <=1600 px.
 # apply_normalizing_transform=false keeps the splat in the COLMAP frame; scene.usd's /World/Splat
 # prim carries the COLMAP -> world (floor at Z=0, meters) transform computed by walls.py.
+# DataLoader workers share batches through /dev/shm; Docker's default 64 MB is too small (Bus error).
+# With little shm: no workers, and skip the test-set eval (its renderer hard-codes 8 workers).
+SHM_MB=$(df -m --output=size /dev/shm | tail -1 | tr -d ' ')
+if [ "$SHM_MB" -lt 2048 ]; then WORKERS=${WORKERS:-0}; TEST_LAST=false; else WORKERS=${WORKERS:-8}; TEST_LAST=true; fi
 python train.py --config-name "$CONFIG" \
   path="$SCENE" out_dir="$SCENE/out/3dgrut_runs" experiment_name="$NAME" \
-  dataset.downsample_factor=1 n_iterations="$ITERS" \
+  dataset.downsample_factor=1 n_iterations="$ITERS" num_workers="$WORKERS" test_last="$TEST_LAST" \
   export_usd.enabled=true export_usd.format=nurec export_usd.apply_normalizing_transform=false \
   export_usd.path="$OUT/splat.usdz" \
   export_ply.enabled=true export_ply.path="$OUT/splat.ply"

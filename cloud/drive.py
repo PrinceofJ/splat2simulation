@@ -22,7 +22,12 @@ ap.add_argument("--headless", action="store_true")
 ap.add_argument("--livestream", action="store_true", help="enable WebRTC streaming (view from the laptop)")
 ap.add_argument("--robot-usd", help="override the Nova Carter asset path/URL")
 ap.add_argument("--onboard-camera", help="prim path of the robot camera to record (default: auto-detect)")
-ap.add_argument("--main", choices=["chase", "overview"], default="chase", help="main view camera")
+ap.add_argument("--main", choices=["chase", "overview"], default="chase",
+                help="main view: chase cam, or a fixed top-down view from just below the ceiling")
+ap.add_argument("--chase-back", type=float, default=1.4, help="chase cam distance behind the robot (m)")
+ap.add_argument("--chase-height", type=float, default=1.7, help="chase cam height (m)")
+ap.add_argument("--overview-height", type=float, default=2.2,
+                help="max overview cam height (m); keep it under the scanned ceiling or the splat hides the room")
 ap.add_argument("--show-proxy", action="store_true", help="show proxy walls/obstacles even with a splat")
 ap.add_argument("--hide-path", action="store_true", help="hide the path line + waypoint markers")
 ap.add_argument("--res", type=int, nargs=2, default=[1280, 720])
@@ -180,10 +185,17 @@ def main():
     main_cam.CreateClippingRangeAttr(Gf.Vec2f(0.05, 200))
     wps = np.array([[w["x"], w["y"]] for w in WAYPOINTS["waypoints"]])
     center = wps.mean(0)
-    span = max(np.ptp(wps, 0).max(), 3.0)
     if args.main == "overview":
-        set_matrix(main_cam.GetPrim(), look_at((center[0] - 0.6 * span, center[1] - 0.6 * span, 0.9 * span),
-                                               (center[0], center[1], 0)))
+        # Straight down from inside the room: a camera outside the scan only sees walls and floaters.
+        # The path's long axis runs along the image width; the focal length is chosen so it fits.
+        axis = np.linalg.svd(wps - center)[2][0] if len(wps) > 1 else np.array([1.0, 0.0])
+        along = np.abs((wps - center) @ axis).max()
+        across = np.abs((wps - center) @ np.array([-axis[1], axis[0]])).max()
+        half_w = max(along, across * args.res[0] / args.res[1]) + 0.8  # meters on the floor, margin around the path
+        h = args.overview_height
+        main_cam.GetFocalLengthAttr().Set(float(main_cam.GetHorizontalApertureAttr().Get() / 2 * h / half_w))
+        set_matrix(main_cam.GetPrim(), look_at((center[0], center[1], h), (center[0], center[1], 0),
+                                               up=(-axis[1], axis[0], 0)))
     log("cameras: main", main_cam.GetPath(), "onboard", onboard)
 
     world.reset()
@@ -210,8 +222,8 @@ def main():
 
     def chase_cam(x, y, yaw):
         back = np.array([math.cos(yaw), math.sin(yaw)])
-        eye = (x - 2.2 * back[0], y - 2.2 * back[1], 1.6)
-        set_matrix(main_cam.GetPrim(), look_at(eye, (x + 0.8 * back[0], y + 0.8 * back[1], 0.3)))
+        eye = (x - args.chase_back * back[0], y - args.chase_back * back[1], args.chase_height)
+        set_matrix(main_cam.GetPrim(), look_at(eye, (x + 1.0 * back[0], y + 1.0 * back[1], 0.2)))
 
     def drive(v, w):
         wl = (v - w * WHEEL_BASE / 2) / WHEEL_RADIUS

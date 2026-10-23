@@ -24,8 +24,8 @@ phone video ─► poses (COLMAP) ─► cloud: 3DGRUT splat ─► NuRec USDZ (
 | 6 train | `cloud/train_3dgrut.sh` | cloud RTX | `splat/splat.usdz`, `splat/splat.ply`, `splat_align.json` |
 | 7 drive | `cloud/drive.py` | cloud RTX | `video/main.mp4`, `video/onboard.mp4`, `video/demo_inset.mp4`, `video/trajectory.csv` |
 
-Stages 6 and 7 have **not been run yet**. They were written on the laptop and are expected to need fixes on the
-first cloud session (asset paths, 3DGRUT config names).
+Stages 6 and 7 were first run end to end on a Brev L40S (Isaac Sim 5.1.0) on 2026-10-23 with the room sample:
+the 30k-iteration splat renders through NuRec and lines up with the detected walls and obstacles.
 
 ---
 
@@ -101,8 +101,8 @@ furniture obstacles. A capture of your own room, aimed at the walls, gives a muc
 then reduces the path to a few corner waypoints. The scale factor is stored in `waypoints.json`.
 
 **export_usd.py**: writes a Z-up, meters scene:
-- `/World/Collision`: invisible static colliders. The ground is a box; walls are boxes; obstacles are extruded
-  footprints (triangle meshes, ear-clipped).
+- `/World/Collision`: invisible static colliders. The ground is a plane (a thin box made Nova Carter's wheels
+  jitter and slide); walls are boxes; obstacles are extruded footprints (triangle meshes, ear-clipped).
 - `/World/Proxy`: visible stand-ins, shown only when no splat is attached (or with `--proxy on`).
 - `/World/Splat`: a reference to the splat USDZ, carrying the COLMAP → world transform. It points at an empty
   `splat/placeholder.usda` until you run `export_usd.py --splat splat/splat.usdz`.
@@ -121,67 +121,118 @@ installed) with `pip install torch gsplat` and the gsplat `simple_trainer.py` at
 ## Cloud (rented RTX GPU, one ~3–5 h session)
 
 **GPU must be RTX-class** (L40S, A10G, L4). A100/H100 have no RT cores and can't render Isaac Sim.
-Easiest: NVIDIA Brev's Isaac Sim launchable, or AWS g6/g5 with an Isaac Sim image. Ubuntu 22.04/24.04, ~50 GB free.
+What was used: **NVIDIA Brev, L40S 48 GB, "Isaac Lab 2.3.2 + Isaac Sim 5.1.0" launchable**.
+
+### How the Brev box is laid out
+
+- The terminal you get (and Claude Code) runs **inside a Docker container**. Isaac Sim is a binary install at
+  `/root/isaacsim`; run scripts with `/root/isaacsim/python.sh`, not a venv.
+- The VM host's filesystem is mounted in the container at `/workspace`, so the host's `/home/ubuntu` is
+  `/workspace/home/ubuntu` from inside. `scp`/`brev copy` from the laptop land on the **host**, not in the container.
+- The project lives at `/root/splat2sim` on the container's own filesystem. **It is not a mounted volume**: it
+  survives a pause only if Brev keeps the container. Before pausing, copy results to `/workspace/home/ubuntu`
+  (see "Before pausing" below).
+- `/dev/shm` is only 64 MB, which breaks PyTorch DataLoader workers. `train_3dgrut.sh` handles it.
+- There is no system CUDA toolkit (no `nvcc`); 3DGRUT downloads its own.
+
+Everything installed lives under the project folder:
+
+| Path | What |
+|---|---|
+| `.tools/uv/` | uv, plus `.tools/uv-python/` (its Python 3.11) and `.tools/uv-cache/` |
+| `.venv/` | Python 3.11 for the pipeline scripts (`stages/*.py`): numpy, scipy, opencv-python-headless, plyfile, usd-core |
+| `.tools/3dgrut/` | 3DGRUT clone, with its own `.venv/` and a local CUDA 12.8 toolkit (~18 GB total) |
+
+`usd-core` must **not** go into Isaac Sim's Python (it clashes with Isaac's own `pxr`). Isaac Sim's Python already
+ships imageio, imageio-ffmpeg and pillow, which is all `drive.py` needs.
 
 ### 0. Setup
 
-```bash
-# Isaac Sim 5.x in its own Python 3.11 venv
-python3.11 -m venv ~/isaac && source ~/isaac/bin/activate
-pip install "isaacsim[all,extscache]==5.1.0" --extra-index-url https://pypi.nvidia.com
-pip install imageio[ffmpeg] numpy scipy opencv-python-headless plyfile usd-core
-# copy the project over (from the laptop):  scp -r C:\dev\splat2sim user@box:~/splat2sim  (skip .venv and tools)
-```
-
-Install Claude Code on the box too, so it can run the scripts and read the logs.
-
-### 1. First, before anything else: check that NuRec loads a sample splat
-
-Open a sample NuRec USDZ in Isaac Sim (see NVIDIA's NuRec docs or the 3DGRUT README samples) and confirm it
-renders. If it doesn't, use the **mesh fallback** (step 4).
-
-### 2. Train the splat (~30–60 min on an L40S)
+Copy the project to the box (`images/`, `sparse/` and `out/` are enough for a scene), then:
 
 ```bash
-bash cloud/train_3dgrut.sh data/room_sample        # ITERS=15000 for a quicker run
+cd /root/splat2sim
+# uv + the pipeline venv, all inside the project
+export UV_INSTALL_DIR=$PWD/.tools/uv UV_PYTHON_INSTALL_DIR=$PWD/.tools/uv-python UV_CACHE_DIR=$PWD/.tools/uv-cache
+curl -LsSf https://astral.sh/uv/install.sh | env UV_NO_MODIFY_PATH=1 sh
+.tools/uv/uv venv --python 3.11 .venv
+.tools/uv/uv pip install --python .venv/bin/python numpy scipy opencv-python-headless plyfile usd-core
 ```
 
-- Installs 3DGRUT into `~/3dgrut` (uv venv) and trains 3DGUT (MCMC config) on `images/` + `sparse/0`.
-- Exports **NuRec** USDZ (`export_usd.format=nurec`, which Isaac Sim 5.x expects) with
+3DGRUT installs itself on the first `train_3dgrut.sh` run (next step). Install Claude Code on the box too, so it
+can run the scripts and read the logs.
+
+If the walls, plan or export need re-running on the box: `.venv/bin/python stages/export_usd.py --scene ...`.
+
+### 1. Train the splat (~20 min on an L40S at 30k iterations)
+
+```bash
+PY=.venv/bin/python bash cloud/train_3dgrut.sh data/room_sample             # default ITERS=30000
+ITERS=2000 PY=.venv/bin/python bash cloud/train_3dgrut.sh data/room_sample  # ~1 min smoke test
+```
+
+- First run only: clones 3DGRUT into `.tools/3dgrut` and installs it with its local-CUDA route
+  (`FORCE_LOCAL_CUDA=1 CUDA_VERSION=12 ./scripts/create_venv_cuda.sh`, then `./install_env_uv.sh`). This takes
+  ~15 min; most of it is downloading CUDA 12.8 (the ~5 GB runfile is cached in `/tmp`, delete it afterwards)
+  and compiling tiny-cuda-nn.
+- Trains 3DGUT (`apps/colmap_3dgut_mcmc.yaml`) on `images/` + `sparse/0`.
+- If `/dev/shm` is under 2 GB it passes `num_workers=0` and `test_last=false` (the test-set renderer hard-codes
+  8 workers). With a bigger shm (`docker run --shm-size=8g`) you get workers and the test PSNR back.
+- Exports **NuRec** USDZ (`export_usd.format=nurec`, what Isaac Sim 5.x renders) with
   `apply_normalizing_transform=false`, so the splat stays in the COLMAP frame.
-- Runs `stages/splat_align.py`: scaled ICP between the splat's Gaussians and the COLMAP points. If 3DGRUT moved
-  the scene anyway, the measured transform goes into `splat_align.json` and export_usd compensates.
-- Re-runs `export_usd.py --splat splat/splat.usdz`.
+- Runs `stages/splat_align.py` with `PY`: scaled ICP between the splat's Gaussians and the COLMAP points. If it
+  measures an offset, it goes into `splat_align.json` and export_usd compensates. (On the 30k sample it reported
+  ~3 cm / 0.3°, which is probably ICP noise from floaters; the 2k run measured identity.)
+- Re-runs `export_usd.py --splat splat/splat.usdz`, which hides the proxy by default.
 
-3DGRUT config keys change between versions. If `train.py` rejects one (for example `export_ply.*` or
-`n_iterations`), check `configs/` and `threedgrut/export/README.md` in the clone and adjust the script.
+3DGRUT config keys change between versions. If `train.py` rejects one, check `configs/` and
+`threedgrut/export/README.md` in the clone and adjust the script. All keys were accepted at 3DGRUT commit `e6f4552`.
 
-### 3. Drive and record
+### 2. Drive and record
 
 ```bash
-source ~/isaac/bin/activate
-python cloud/drive.py --scene data/room_sample --headless              # chase cam + onboard cam
-python cloud/drive.py --scene data/room_sample --main overview          # fixed overview camera
-python cloud/drive.py --scene data/room_sample --livestream             # watch via the WebRTC client
+/root/isaacsim/python.sh cloud/drive.py --scene data/room_sample --headless                  # chase cam + onboard cam
+/root/isaacsim/python.sh cloud/drive.py --scene data/room_sample --headless --show-proxy     # + detected walls/obstacles
+/root/isaacsim/python.sh cloud/drive.py --scene data/room_sample --headless --main overview  # top-down from below the ceiling
+/root/isaacsim/python.sh cloud/drive.py --scene data/room_sample --livestream                # watch via the WebRTC client
 ```
 
-- Spawns Nova Carter at the plan's start pose. It tries several asset paths because the layout moved
-  between releases; override with `--robot-usd`. Wheel joints are found by name (`joint_wheel_left/right`
-  or anything containing "wheel" + "left/right").
+Each run overwrites `out/video/`; rename it between runs. Rendering runs at roughly 6–9 s wall time per sim second.
+
+- Spawns Nova Carter at the plan's start pose. In 5.1 the asset is
+  `/Isaac/Robots/NVIDIA/NovaCarter/nova_carter.usd` on the S3 asset root (the first of the candidates
+  `drive.py` tries); override with `--robot-usd`. Wheel joints are `joint_wheel_left/right`.
 - Proportional controller: heading error → angular velocity; distance → linear velocity, damped by cos²(heading
   error). Converted to wheel speeds with r = 0.14 m and wheel base 0.4132 m.
-- Onboard camera: the first robot camera whose path contains "front"/"left". If none is found, a camera is mounted
-  on the chassis. Override with `--onboard-camera`.
+- Onboard camera: `chassis_link/sensors/front_hawk/left/camera_left`. Override with `--onboard-camera`.
+- Main camera: chase cam (`--chase-back 1.4 --chase-height 1.7`), or `--main overview`, a straight-down view at
+  `--overview-height 2.2` with the focal length fitted to the path. Keep both cameras inside the scanned room:
+  outside it they see only floaters.
 - Records `main.mp4`, `onboard.mp4`, and `demo_inset.mp4` (main view with the onboard view inset), plus
-  `trajectory.csv`.
-- Flags: `--show-proxy` shows the detected walls and obstacles over the splat, and `--hide-path` hides the
-  path line.
+  `trajectory.csv`. `--hide-path` hides the path line.
 
-### 4. Fallback if NuRec won't load the splat
+### 3. Fallback if NuRec won't load the splat
 
-Use a mesh as the visual instead: for example 3DGRUT/gsplat mesh extraction, or a Polycam/Scaniverse mesh
-export aligned with `splat_align.py`. Reference it from `/World/Splat` the same way, or just run
-`drive.py --show-proxy` to show the detected geometry.
+Not needed on Isaac Sim 5.1: NuRec rendered the 3DGRUT USDZ directly and depth-composites it with the robot and
+proxies. If a future version breaks it, use a mesh as the visual instead (3DGRUT/gsplat mesh extraction, or a
+Polycam/Scaniverse mesh export aligned with `splat_align.py`), referenced from `/World/Splat` the same way, or
+just run `drive.py --show-proxy` to show the detected geometry.
+
+### Before pausing the instance
+
+Bundle the results (skipping the 18 GB of reinstallable tools, the checkpoints and the input images) and put the
+tarball on the host disk, where it survives even if the container is recreated:
+
+```bash
+cd /root && tar czf splat2sim_session.tgz \
+  --exclude=splat2sim/.tools --exclude=splat2sim/.venv \
+  --exclude='splat2sim/data/*/images' --exclude='splat2sim/data/*/sparse' --exclude='splat2sim/data/*/out/3dgrut_runs*' \
+  splat2sim
+cp splat2sim_session.tgz /workspace/home/ubuntu/
+# then on the laptop:  scp <instance>:/home/ubuntu/splat2sim_session.tgz .
+```
+
+Keep `out/3dgrut_runs/` (~2 GB) too if you may want to re-export the USDZ without retraining.
 
 ---
 

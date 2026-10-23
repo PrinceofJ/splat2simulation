@@ -3,7 +3,7 @@
 /World
   PhysicsScene
   Collision/            invisible static colliders
-    Ground              thin box at Z=0
+    Ground              plane collider at Z=0 (a thin box collider made the wheels jitter)
     Walls/wall_XX       one box per detected wall segment
     Obstacles/obst_XX   extruded obstacle footprints (triangle meshes)
   Proxy/                visible stand-ins (no collision): gray floor, walls, obstacles.
@@ -145,7 +145,13 @@ def main():
     gc, gs = ((x0 + x1) / 2, (y0 + y1) / 2), (x1 - x0 + 4, y1 - y0 + 4)
 
     UsdGeom.Scope.Define(stage, "/World/Collision")
-    box(stage, "/World/Collision/Ground", gc, gs, 0.1, 0, collision=True, z0=-0.1)
+    ground = UsdGeom.Plane.Define(stage, "/World/Collision/Ground")  # PhysX treats it as an infinite plane
+    ground.CreateAxisAttr(UsdGeom.Tokens.z)
+    ground.CreateWidthAttr(float(gs[0]))
+    ground.CreateLengthAttr(float(gs[1]))
+    set_xform(ground.GetPrim(), (gc[0], gc[1], 0))
+    UsdPhysics.CollisionAPI.Apply(ground.GetPrim())
+    ground.MakeInvisible()
     UsdGeom.Scope.Define(stage, "/World/Collision/Walls")
     for w in W["walls"]:
         p0, p1 = np.array(w["p0"]) * s, np.array(w["p1"]) * s
