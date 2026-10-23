@@ -8,6 +8,7 @@ Output layout (what 3DGRUT / gsplat expect):
 Examples:
     python stages/poses.py --video data/my_room/scan.mp4 --work data/my_room
     python stages/poses.py --images data/room_sample/images --work data/room_sample
+    python stages/poses.py --work data/my_room --remap --mapper incremental   # redo mapping only
 """
 import argparse
 import shutil
@@ -17,8 +18,9 @@ import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 
-from common import COLMAP_EXE
+from common import COLMAP_EXE, camera_centers_and_ups, read_images_bin
 
 
 def sharpness(img):
@@ -78,9 +80,11 @@ def colmap(*args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    src = ap.add_mutually_exclusive_group(required=True)
+    src = ap.add_mutually_exclusive_group()
     src.add_argument("--video", type=Path)
     src.add_argument("--images", type=Path)
+    src.add_argument("--remap", action="store_true",
+                     help="reuse <work>/images and database.db (features + matches) and only re-run the mapper")
     ap.add_argument("--work", type=Path, required=True, help="scene folder to write into")
     ap.add_argument("--max-size", type=int, default=1600, help="longest image side in px")
     ap.add_argument("--frames", type=int, default=250, help="frames to keep from a video")
@@ -94,8 +98,24 @@ def main():
     if not COLMAP_EXE.exists():
         sys.exit(f"COLMAP not found at {COLMAP_EXE}. See README, 'Laptop setup'.")
 
+    if not (args.video or args.images or args.remap):
+        ap.error("one of --video, --images or --remap is required")
+
     work = args.work
     img_dir = work / "images"
+    db = work / "database.db"
+    sparse = work / "sparse"
+    gpu = "0" if args.no_gpu else "1"
+
+    if args.remap:
+        if not db.exists():
+            sys.exit(f"--remap needs an existing {db} from a previous run")
+        if sparse.exists():
+            shutil.rmtree(sparse)
+        sparse.mkdir()
+        run_mapper(args.mapper, db, img_dir, sparse)
+        return
+
     if args.images and args.images.resolve() == img_dir.resolve():
         n = len(list(img_dir.glob("*.jpg")))  # already in place: use as-is
     else:
@@ -105,13 +125,10 @@ def main():
         n = (extract_video_frames(args.video, img_dir, args.frames, args.max_size) if args.video
              else copy_images(args.images, img_dir, args.max_size))
 
-    db = work / "database.db"
     db.unlink(missing_ok=True)
-    sparse = work / "sparse"
     if sparse.exists():
         shutil.rmtree(sparse)
     sparse.mkdir()
-    gpu = "0" if args.no_gpu else "1"
 
     def extract(use_gpu):
         colmap("feature_extractor", "--database_path", db, "--image_path", img_dir,
@@ -139,7 +156,11 @@ def main():
     else:
         colmap("exhaustive_matcher", "--database_path", db, "--FeatureMatching.use_gpu", gpu)
 
-    if args.mapper == "global":
+    run_mapper(args.mapper, db, img_dir, sparse)
+
+
+def run_mapper(mapper, db, img_dir, sparse):
+    if mapper == "global":
         colmap("global_mapper", "--database_path", db, "--image_path", img_dir, "--output_path", sparse)
     else:
         colmap("mapper", "--database_path", db, "--image_path", img_dir, "--output_path", sparse)
@@ -148,10 +169,32 @@ def main():
     if not models:
         sys.exit("COLMAP produced no model. Try --mapper incremental or --matcher exhaustive.")
     if len(models) > 1:
-        print(f"WARNING: COLMAP split the scene into {len(models)} models; using sparse/0. "
-              "More overlap in the capture usually fixes this.")
-    colmap("model_analyzer", "--path", models[0])
-    print(f"\nDone. Model: {models[0]}")
+        # the incremental mapper doesn't order models by size: make the biggest one sparse/0
+        sizes = {p: len(read_images_bin(p / "images.bin")) for p in models}
+        biggest = max(models, key=sizes.get)
+        if biggest != sparse / "0":
+            (sparse / "0").rename(sparse / "tmp")
+            biggest.rename(sparse / "0")
+            (sparse / "tmp").rename(biggest)
+        print(f"WARNING: COLMAP split the scene into {len(models)} models (sizes {sorted(sizes.values(), reverse=True)}); "
+              "using the biggest as sparse/0. More overlap in the capture usually fixes this.")
+    colmap("model_analyzer", "--path", sparse / "0")
+    check_cameras(sparse / "0", mapper)
+    print(f"\nDone. Model: {sparse / '0'}")
+
+
+def check_cameras(model, mapper):
+    """Flag cameras placed implausibly far from the rest (a known global-mapper failure on hard video)."""
+    centers, _ = camera_centers_and_ups(read_images_bin(model / "images.bin"))
+    d = np.linalg.norm(centers - np.median(centers, 0), axis=1)
+    bad = d > 5 * np.median(d) + 1e-9
+    if bad.mean() > 0.03:
+        hint = (" Re-run just the mapping step with: --remap --mapper incremental" if mapper == "global"
+                else " The capture probably needs more overlap or less blur.")
+        print(f"WARNING: {bad.sum()} of {len(centers)} cameras sit more than 5x the median distance from the "
+              f"rest of the path, so the model is likely broken.{hint}")
+    else:
+        print(f"camera check: {bad.sum()} of {len(centers)} cameras look misplaced (ok)")
 
 
 if __name__ == "__main__":
