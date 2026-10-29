@@ -3,8 +3,30 @@
 Phone scan of a room → COLMAP poses → detected walls and obstacles → A* path → `scene.usd` →
 Nova Carter drives the path in Isaac Sim over a Gaussian-splat render of the real room.
 
-A minimal vertical slice for a ~45 s demo video. See [SPLAT2SIM_KICKOFF.md](SPLAT2SIM_KICKOFF.md) for the why.
+A minimal vertical slice: how far does a phone scan get you toward a robot training environment in Isaac Sim?
 It's a **planner**, not a learned policy.
+
+## Demo
+
+Results on the public Mip-NeRF 360 "room" scene (311 photos), with stages 6–7 on a rented L40S
+(Isaac Sim 5.1). Files are in [`demo/`](demo/).
+
+| | |
+|---|---|
+| [1_density.png](demo/1_density.png) | top-down density of points 0.12–2 m above the fitted floor |
+| [2_wall_lines.png](demo/2_wall_lines.png) | wall band (1.1–2.4 m) and the axis-aligned Hough segments |
+| [3_walls_obstacles.png](demo/3_walls_obstacles.png) | detected wall (red) and obstacles (orange) |
+| [4_planned_path.png](demo/4_planned_path.png) | A* path, inflated by the robot radius |
+| [5_splat_vs_detected_geometry.png](demo/5_splat_vs_detected_geometry.png) | the 3DGRUT splat in Isaac Sim, alone (left) and with the detected collision geometry overlaid (right) |
+| [isaac_chase_onboard_inset.mp4](demo/isaac_chase_onboard_inset.mp4) | Nova Carter follows the path; inset is its front camera |
+| [isaac_chase_detected_geometry.mp4](demo/isaac_chase_detected_geometry.mp4) | same drive with the invisible colliders shown |
+| [isaac_overview.mp4](demo/isaac_overview.mp4) | top-down view from just below the ceiling |
+
+Robot tracking on that run: 1.7 cm mean / 5.6 cm max cross-track error, never closer than 0.43 m to an obstacle,
+goal reached in 8.5 s over 4 m. Splat training: 30k iterations in 19 min.
+
+Known gap: rooms with plain white walls give COLMAP almost no wall points, so walls come out empty. Detecting walls
+from the trained splat instead is in progress on the `wip/walls-from-splat` branch (untested).
 
 ```
 phone video ─► poses (COLMAP) ─► cloud: 3DGRUT splat ─► NuRec USDZ (visual)
@@ -66,7 +88,9 @@ furniture obstacles. A capture of your own room, aimed at the walls, gives a muc
 
 ### Your own room
 
-1. Record a 1–2 min video (see the capture checklist in the kickoff doc) and copy it to `data/my_room/scan.mp4`.
+1. Record a 2–3 min video in landscape at 4K: 2–3 slow passes (across the room, outward toward the walls, then one
+   at knee height along the robot's route), staying 1.5–3 m from what you film, with the floor cleared and exposure
+   locked. Copy it to `data/my_room/scan.mp4` without recompressing it.
 2. `poses.py --video data/my_room/scan.mp4 --work data/my_room`
    - It keeps the sharpest frame in each window (`--frames 250`), resizes to 1600 px, and uses the sequential
      matcher plus COLMAP's global mapper.
