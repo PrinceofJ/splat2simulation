@@ -3,9 +3,6 @@
 Phone scan of a room → COLMAP poses → detected walls and obstacles → A* path → `scene.usd` →
 Nova Carter drives the path in Isaac Sim over a Gaussian-splat render of the real room.
 
-A minimal vertical slice: how far does a phone scan get you toward a robot training environment in Isaac Sim?
-It's a **planner**, not a learned policy.
-
 ## Demo
 
 Results on the public Mip-NeRF 360 "room" scene (311 photos), with stages 6–7 on a rented L40S
@@ -133,7 +130,7 @@ then reduces the path to a few corner waypoints. The scale factor is stored in `
 - `/World/Plan`: the path curve and waypoint spheres. Waypoints are also stored as the `splat2sim:waypoints`
   attribute, plus a `Start` pose.
 
-### Optional: low-res gsplat preview (not built yet)
+### Optional: low-res gsplat preview (TODO)
 
 gsplat compiles CUDA kernels on first use, which needs a CUDA toolkit no newer than your driver
 (12.3 today) plus a matching PyTorch. Neither is installed. The easiest route is WSL Ubuntu 22.04 (already
